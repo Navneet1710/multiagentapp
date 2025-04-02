@@ -6,3 +6,4 @@ langgraph>=0.0.20
 streamlit>=1.30.0
 python-dotenv>=1.0.0
 wolframalpha>=5.0.0
+duckduckgo-search>=3.0.0
