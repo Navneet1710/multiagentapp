@@ -5,6 +5,7 @@ from langchain_groq import ChatGroq
 from langchain.chains import LLMChain
 from langchain.agents import Tool, AgentExecutor, AgentType, initialize_agent
 from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_community.utilities.serpapi import SerpAPIWrapper
 from langchain_community.utilities.wolfram_alpha import WolframAlphaAPIWrapper
 from langchain_community.tools.wolfram_alpha.tool import WolframAlphaQueryRun
 from langgraph.graph import StateGraph, END
@@ -78,8 +79,8 @@ def create_math_science_agent(math_science_llm):
         agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
         verbose=True,
         handle_parsing_errors=True,
-        max_iterations=20,  # Increased from 5 to 10
-        max_execution_time=120  # Set maximum execution time to 60 seconds
+        max_iterations=10,
+        max_execution_time=60
     )
 
 def create_code_agent(code_llm):
@@ -100,20 +101,54 @@ def create_code_agent(code_llm):
         agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
         verbose=True,
         handle_parsing_errors=True,
-        max_iterations=15,  # Increased from 5 to 8
-        max_execution_time=60  # Set maximum execution time to 50 seconds
+        max_iterations=8,
+        max_execution_time=50
     )
 
 def create_websearch_agent(general_llm):
     """Create the web search specialized agent"""
-    search_tool = DuckDuckGoSearchRun()
-    search_tools = [
-        Tool(
-            name="Web Search",
-            func=search_tool.run,
-            description="Searches the web for relevant information on a wide range of topics."
+    # Try to create a SerpAPI search tool if API key is available
+    search_tools = []
+    
+    if "SERPAPI_API_KEY" in os.environ:
+        # Use SerpAPI if key is available
+        search = SerpAPIWrapper()
+        search_tools.append(
+            Tool(
+                name="Web Search",
+                func=search.run,
+                description="Searches the web for relevant information on a wide range of topics."
+            )
         )
-    ]
+    else:
+        try:
+            # Fall back to DuckDuckGo with increased timeout
+            search_tool = DuckDuckGoSearchRun(timeout=10)
+            search_tools.append(
+                Tool(
+                    name="Web Search",
+                    func=search_tool.run,
+                    description="Searches the web for relevant information on a wide range of topics."
+                )
+            )
+        except Exception:
+            # If both fail, create a dummy search tool
+            search_tools.append(
+                Tool(
+                    name="Web Search",
+                    func=lambda x: "I'm unable to search the web right now. I'll try to answer based on my own knowledge.",
+                    description="Searches the web for relevant information on a wide range of topics."
+                )
+            )
+    
+    # Define a backup tool that doesn't require web access
+    backup_tool = Tool(
+        name="Knowledge Base",
+        func=lambda x: general_llm.invoke(f"Please provide information about: {x}").content,
+        description="Uses internal knowledge to answer questions when web search is unavailable."
+    )
+    
+    search_tools.append(backup_tool)
 
     # Use initialize_agent instead of create_react_agent with increased limits
     return initialize_agent(
@@ -122,8 +157,8 @@ def create_websearch_agent(general_llm):
         agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
         verbose=True,
         handle_parsing_errors=True,
-        max_iterations=15,  # Increased from 5 to 8
-        max_execution_time=60  # Set maximum execution time to 50 seconds
+        max_iterations=8,
+        max_execution_time=50
     )
 
 def format_conversation_history(history):
@@ -183,7 +218,7 @@ Take your time with mathematical and scientific problems, especially for complex
         except Exception as e:
             # Handle timeout or other exceptions gracefully
             error_message = str(e)
-            return {"response": f"🧪 Math/Science Agent: I encountered a complexity limit with this problem. Here's what I know about linear programming and your question: In linear programming, if a constraint is an equality, the corresponding dual variable is unrestricted in sign. This is because equality constraints can be either binding from above or below, unlike inequalities that bind in only one direction. For a complete answer to your GATE 2018 question, please consider reformulating it or breaking it into smaller parts."}
+            return {"response": f"🧪 Math/Science Agent: I encountered a complexity limit with this problem. Here's what I know about this topic: {error_message[:200]}... Please consider reformulating or breaking down your question."}
 
     def process_code(state: AgentState) -> Dict:
         """Process query with code agent with context awareness."""
@@ -201,7 +236,7 @@ Please answer the current question considering any relevant context from the pre
             return {"response": f"💻 Code Agent: {response}"}
         except Exception as e:
             error_message = str(e)
-            return {"response": f"💻 Code Agent: I hit a complexity limit while working on this problem. Here's what I can tell you based on the progress I made: {error_message[:200]}... Please consider simplifying your query or breaking it into smaller parts."}
+            return {"response": f"💻 Code Agent: I hit a complexity limit while working on this problem. Please consider simplifying your query or breaking it into smaller parts."}
 
     def process_websearch(state: AgentState) -> Dict:
         """Process query with websearch agent with context awareness."""
@@ -213,13 +248,19 @@ Previous conversation:
 Current question: {state["query"]}
 
 Please answer the current question considering any relevant context from the previous conversation.
+If web search is unavailable, please answer using your internal knowledge.
 """
         try:
             response = websearch_executor.run(context_query)
             return {"response": f"🔍 Web Search Agent: {response}"}
         except Exception as e:
-            error_message = str(e)
-            return {"response": f"🔍 Web Search Agent: I hit a limit while searching for this information. Here's what I found so far: {error_message[:200]}... Please consider refining your query."}
+            # Fall back to the LLM's built-in knowledge
+            fallback_response = general_llm.invoke(f"""
+You are a helpful assistant answering a question based on your training knowledge without web search.
+The question is: {state["query"]}
+Please provide a helpful response using only what you already know.
+""").content
+            return {"response": f"🔍 Web Search Agent: I'm unable to search the web right now, but here's what I know: {fallback_response}"}
 
     # Build the LangGraph
     workflow = StateGraph(AgentState)
