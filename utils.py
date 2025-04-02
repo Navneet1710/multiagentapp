@@ -79,8 +79,8 @@ def create_math_science_agent(math_science_llm):
         agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
         verbose=True,
         handle_parsing_errors=True,
-        max_iterations=10,
-        max_execution_time=60
+        max_iterations=20,
+        max_execution_time=120
     )
 
 def create_code_agent(code_llm):
@@ -101,8 +101,8 @@ def create_code_agent(code_llm):
         agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
         verbose=True,
         handle_parsing_errors=True,
-        max_iterations=8,
-        max_execution_time=50
+        max_iterations=15,
+        max_execution_time=60
     )
 
 def create_websearch_agent(general_llm):
@@ -157,8 +157,8 @@ def create_websearch_agent(general_llm):
         agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
         verbose=True,
         handle_parsing_errors=True,
-        max_iterations=8,
-        max_execution_time=50
+        max_iterations=20,
+        max_execution_time=60
     )
 
 def format_conversation_history(history):
