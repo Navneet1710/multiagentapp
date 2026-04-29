@@ -5,126 +5,140 @@ from utils import (
     create_llms,
     create_orchestrator,
     create_math_science_agent,
-    create_code_agent, 
+    create_code_agent,
     create_websearch_agent,
     build_workflow
 )
 
-# Load environment variables from .env file
 load_dotenv()
 
-# Check if required API keys are present
 if "GROQ_API_KEY" not in os.environ:
-    st.error("GROQ_API_KEY not found in environment variables. Please add it to your .env file.")
+    st.error("GROQ_API_KEY not found. Please add it to your .env file.")
     st.stop()
 
-# Set page title and configuration
 st.set_page_config(page_title="Multi-Agent System", layout="wide")
-st.title("Multi-Agent Query System")
+st.title("🤖 Multi-Agent Query System")
 
-# Initialize session state for conversation history if it doesn't exist
+# ── Session State ─────────────────────────────────────────────────────────────
 if "conversation_history" not in st.session_state:
     st.session_state.conversation_history = []
 
-# Sidebar with information
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.subheader("About")
     st.markdown("""
-    This app demonstrates a multi-agent system built with:
-    - LangChain for agent definition
-    - LangGraph for workflow orchestration
-    - Groq for LLM API access
-    - Streamlit for the user interface
-    
-    Each agent specializes in a different domain to provide accurate responses.
+    Routes queries to specialized agents:
+    - **🧪 Math/Science** — equations, derivations, research
+    - **💻 Code** — algorithms, implementations, LeetCode
+    - **🔍 Web Search** — news, general knowledge
+
+    Specialized agents try first. If they fail, the **web agent acts as fallback**.
     """)
-    
-    # Show API status
+
     st.subheader("API Status")
     st.success("✅ Groq API Key detected")
-    
     if "WOLFRAM_ALPHA_APPID" in os.environ:
-        st.success("✅ Wolfram Alpha API detected")
+        st.success("✅ Wolfram Alpha detected")
     else:
-        st.warning("⚠️ Wolfram Alpha API not configured (optional)")
-    
-    # Add context management options
-    st.subheader("Context Management")
-    if st.button("Clear Conversation History"):
+        st.warning("⚠️ Wolfram Alpha not configured (optional)")
+    if "SERPAPI_API_KEY" in os.environ:
+        st.success("✅ SerpAPI detected")
+    else:
+        st.info("ℹ️ SerpAPI not set — using DuckDuckGo")
+
+    st.subheader("Context")
+    if st.button("🗑️ Clear Conversation History"):
         st.session_state.conversation_history = []
-        st.success("Conversation history cleared!")
+        st.success("Cleared!")
 
-# Initialize LLMs
+# ── Init agents (cached implicitly by Streamlit's top-level execution) ────────
 general_llm, math_science_llm, code_llm = create_llms()
-
-# Create agents
-orchestrator_chain = create_orchestrator(general_llm)
+orchestrator_chain    = create_orchestrator(general_llm)
 math_science_executor = create_math_science_agent(math_science_llm)
-code_executor = create_code_agent(code_llm)
-websearch_executor = create_websearch_agent(general_llm)
+code_executor         = create_code_agent(code_llm)
+websearch_executor    = create_websearch_agent(general_llm)
 
-# Build workflow
 agent_graph = build_workflow(
-    orchestrator_chain, 
-    math_science_executor, 
-    code_executor, 
+    orchestrator_chain,
+    math_science_executor,
+    code_executor,
     websearch_executor
 )
 
-# Main app content
-st.markdown("""
-This system routes your questions to specialized agents:
-- **Math/Science Agent**: For mathematics, physics, chemistry, etc.
-- **Code Agent**: For programming, algorithms, debugging, etc.
-- **Web Search Agent**: For general knowledge, history, news, etc.
+# ── Conversation History expander ─────────────────────────────────────────────
+if st.session_state.conversation_history:
+    with st.expander("📜 Conversation History", expanded=False):
+        for i, ex in enumerate(st.session_state.conversation_history):
+            st.markdown(f"**Query {i+1}:** {ex['query']}")
+            st.markdown(f"**Category:** `{ex['category']}`")
 
-This system maintains context between queries so you can ask follow-up questions.
+            # Show agent trail as badges
+            if ex.get("agents_tried"):
+                badges = "  ".join([f"`{a}`" for a in ex["agents_tried"]])
+                st.markdown(f"**Agents tried:** {badges}")
+
+            st.markdown(f"**Response:** {ex['response'][:400]}...")
+            st.divider()
+
+# ── Main Input ────────────────────────────────────────────────────────────────
+st.markdown("""
+Ask anything — math problems, coding questions, or general knowledge.
+The system picks the best agent automatically and falls back to web search if needed.
 """)
 
-# Display conversation history
-if st.session_state.conversation_history:
-    with st.expander("Conversation History", expanded=False):
-        for i, exchange in enumerate(st.session_state.conversation_history):
-            st.markdown(f"**Query {i+1}:** {exchange['query']}")
-            st.markdown(f"**Response:** {exchange['response']}")
-            st.markdown("---")
+query = st.text_input("Enter your question:", key="user_query", placeholder="e.g. Derive the optical flow equation")
 
-# User input
-query = st.text_input("Enter your question:", key="user_query")
-
-if st.button("Submit") or st.session_state.get("automatic_submit", False):
-    if query:
-        with st.spinner("Agents are working on your query..."):
+if st.button("🚀 Submit"):
+    if query.strip():
+        with st.spinner("Agents working on your query..."):
             try:
-                # Execute workflow with conversation history
                 result = agent_graph.invoke({
-                    "query": query, 
-                    "category": "", 
+                    "query": query,
+                    "category": "",
                     "response": "",
+                    "agents_tried": [],
                     "conversation_history": st.session_state.conversation_history
                 })
-                
-                # Display results
-                st.subheader("Result")
+
+                # ── Agent Trail ───────────────────────────────────────────────
+                st.subheader("🔎 Agent Pipeline")
+                agents = result.get("agents_tried", [])
+                if agents:
+                    cols = st.columns(len(agents))
+                    for i, agent_name in enumerate(agents):
+                        with cols[i]:
+                            if "fallback" in agent_name.lower():
+                                st.error(f"⚠️ {agent_name}")
+                            elif i == 0:
+                                st.success(f"✅ {agent_name}")
+                            else:
+                                st.warning(f"🔄 {agent_name}")
+                    if len(agents) > 1:
+                        st.info(
+                            f"ℹ️ Primary agent couldn't solve this — "
+                            f"**{agents[-1]}** was used as fallback."
+                        )
+                    else:
+                        st.success("✅ Solved by primary agent — no fallback needed.")
+
+                # ── Category badge ─────────────────────────────────────────────
+                cat = result.get("category", "unknown")
+                cat_icon = {"math/science": "🧪", "code": "💻", "websearch": "🔍"}.get(cat, "🤖")
+                st.caption(f"Classified as: {cat_icon} **{cat}**")
+
+                # ── Response ───────────────────────────────────────────────────
+                st.subheader("📋 Result")
                 st.markdown(result["response"])
-                
-                # Store in session state for this exchange
-                exchange = {
+
+                # ── Save to history ────────────────────────────────────────────
+                st.session_state.conversation_history.append({
                     "query": query,
                     "category": result["category"],
-                    "response": result["response"]
-                }
-                
-                # Add to conversation history
-                st.session_state.conversation_history.append(exchange)
-                
+                    "response": result["response"],
+                    "agents_tried": agents
+                })
+
             except Exception as e:
-                st.error(f"An error occurred: {str(e)}")
+                st.error(f"Unexpected error: {str(e)}")
     else:
         st.warning("Please enter a question first.")
-
-# Display previous results if available from current exchange
-if st.session_state.conversation_history:
-    latest = st.session_state.conversation_history[-1]
-    with st.expander("Last Query Details", expanded=False):
-        st.info(f"Query classified as: {latest['category']}")

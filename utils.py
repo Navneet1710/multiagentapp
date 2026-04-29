@@ -2,293 +2,315 @@ import os
 from typing import Dict, TypedDict, Literal, List
 from langchain_core.prompts import PromptTemplate
 from langchain_groq import ChatGroq
-from langchain.chains import LLMChain
-from langchain.agents import Tool, AgentExecutor, AgentType, initialize_agent
+from langchain.agents import Tool, AgentType, initialize_agent
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_community.utilities.serpapi import SerpAPIWrapper
 from langchain_community.utilities.wolfram_alpha import WolframAlphaAPIWrapper
 from langchain_community.tools.wolfram_alpha.tool import WolframAlphaQueryRun
 from langgraph.graph import StateGraph, END
 
-# Define state schema for LangGraph with conversation history
+# ── State Schema ────────────────────────────────────────────────────────────
 class AgentState(TypedDict):
     query: str
     category: str
     response: str
+    agents_tried: List[str]           # NEW: tracks every agent that ran
     conversation_history: List[Dict[str, str]]
 
+
+# ── LLM Factory ─────────────────────────────────────────────────────────────
 def create_llms():
-    """Initialize LLMs with Groq API using environment variables"""
-    # Initialize LLMs with different configurations
-    general_llm = ChatGroq(temperature=0.3, model="llama3-70b-8192")
-    math_science_llm = ChatGroq(temperature=0.1, model="llama3-70b-8192")
-    code_llm = ChatGroq(temperature=0.1, model="llama3-70b-8192")
-    
+    general_llm      = ChatGroq(temperature=0.3, model="llama-3.1-8b-instant")
+    math_science_llm = ChatGroq(temperature=0.1, model="meta-llama/llama-4-scout-17b-16e-instruct")
+    code_llm         = ChatGroq(temperature=0.1, model="openai/gpt-oss-20b")
     return general_llm, math_science_llm, code_llm
 
+
+# ── Orchestrator ─────────────────────────────────────────────────────────────
 def create_orchestrator(general_llm):
-    """Create the orchestrator agent that classifies queries"""
     orchestrator_prompt = PromptTemplate.from_template("""
-    You are a query classifier. Your job is to classify user queries into one of these categories:
-    - 'math/science': Questions about mathematics, physics, chemistry, biology, etc.
-    - 'code': Questions about programming, coding, algorithms, debugging, etc.
-    - 'websearch': General knowledge questions, current events, history, etc.
+You are a query classifier. Classify the user query into exactly one category:
 
-    Previous conversation context:
-    {conversation_history}
+- 'math/science' : mathematics, physics, chemistry, biology, equations, derivations, proofs, research
+- 'code'         : programming, coding, algorithms, data structures, debugging, LeetCode problems, any request for code
+- 'websearch'    : current events, news, history, general knowledge, opinions
 
-    Current Query: {query}
+Rules:
+- If the query explicitly asks for code, an implementation, or a programming solution → ALWAYS classify as 'code'
+- If the query is about deriving an equation or formula → classify as 'math/science'
+- When in doubt between code and math/science, prefer 'code' if there is any coding element
 
-    Consider both the current query and any relevant context from previous interactions.
-    Respond with only one word: 'math/science', 'code', or 'websearch'.
-    """)
+Previous conversation:
+{conversation_history}
 
-    return LLMChain(llm=general_llm, prompt=orchestrator_prompt)
+Current Query: {query}
 
+Respond with ONLY one of: 'math/science', 'code', 'websearch'
+""")
+    # Use the new pipe syntax instead of deprecated LLMChain
+    return orchestrator_prompt | general_llm
+
+
+# ── Math / Science Agent ─────────────────────────────────────────────────────
 def create_math_science_agent(math_science_llm):
-    """Create the math/science specialized agent"""
-    wolfram_tool = None
+    """Returns a tuple (mode, executor) — 'react' if Wolfram available, else 'direct'."""
     if "WOLFRAM_ALPHA_APPID" in os.environ:
         wolfram = WolframAlphaAPIWrapper()
         wolfram_tool = WolframAlphaQueryRun(api_wrapper=wolfram)
-
-    math_science_tools = []
-    if wolfram_tool:
-        math_science_tools.append(
+        tools = [
             Tool(
                 name="Wolfram Alpha",
                 func=wolfram_tool.run,
-                description="Useful for mathematical calculations, scientific information, and precise factual queries."
+                description="Use for mathematical calculations, equations, unit conversions, and scientific facts."
             )
+        ]
+        agent = initialize_agent(
+            tools=tools,
+            llm=math_science_llm,
+            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+            verbose=True,
+            handle_parsing_errors=True,
+            max_iterations=8,
+            max_execution_time=45,
         )
-    
-    # If no Wolfram Alpha, create a dummy calculator tool to ensure we have tools
-    if not math_science_tools:
-        math_science_tools.append(
-            Tool(
-                name="Calculator",
-                func=lambda x: eval(x),
-                description="Useful for performing basic mathematical calculations."
-            )
-        )
+        return ("react", agent)
+    return ("direct", math_science_llm)
 
-    # Use initialize_agent instead of create_react_agent with increased iteration limit
-    return initialize_agent(
-        tools=math_science_tools,
-        llm=math_science_llm,
-        agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-        verbose=True,
-        handle_parsing_errors=True,
-        max_iterations=20,
-        max_execution_time=120
-    )
 
+# ── Code Agent ───────────────────────────────────────────────────────────────
 def create_code_agent(code_llm):
-    """Create the code specialized agent"""
-    # Create a dummy tool to satisfy ReAct agent requirements
-    code_tools = [
-        Tool(
-            name="CodeExecutor",
-            func=lambda x: "This is a placeholder for code execution. In a real environment, this would execute the code.",
-            description="A tool to execute code and return the result."
-        )
-    ]
+    """Always uses direct LLM — placeholder tools cause ReAct parsing failures."""
+    return ("direct", code_llm)
 
-    # Use initialize_agent instead of create_react_agent with increased limits
-    return initialize_agent(
-        tools=code_tools,
-        llm=code_llm,
-        agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-        verbose=True,
-        handle_parsing_errors=True,
-        max_iterations=15,
-        max_execution_time=60
-    )
 
+# ── Web Search Agent ─────────────────────────────────────────────────────────
 def create_websearch_agent(general_llm):
-    """Create the web search specialized agent"""
-    # Try to create a SerpAPI search tool if API key is available
     search_tools = []
-    
     if "SERPAPI_API_KEY" in os.environ:
-        # Use SerpAPI if key is available
         search = SerpAPIWrapper()
-        search_tools.append(
-            Tool(
-                name="Web Search",
-                func=search.run,
-                description="Searches the web for relevant information on a wide range of topics."
-            )
-        )
+        search_tools.append(Tool(
+            name="Web Search",
+            func=search.run,
+            description="Searches the web for relevant, up-to-date information."
+        ))
     else:
         try:
-            # Fall back to DuckDuckGo with increased timeout
-            search_tool = DuckDuckGoSearchRun(timeout=10)
-            search_tools.append(
-                Tool(
-                    name="Web Search",
-                    func=search_tool.run,
-                    description="Searches the web for relevant information on a wide range of topics."
-                )
-            )
+            ddg = DuckDuckGoSearchRun(timeout=10)
+            search_tools.append(Tool(
+                name="Web Search",
+                func=ddg.run,
+                description="Searches the web for relevant information."
+            ))
         except Exception:
-            # If both fail, create a dummy search tool
-            search_tools.append(
-                Tool(
-                    name="Web Search",
-                    func=lambda x: "I'm unable to search the web right now. I'll try to answer based on my own knowledge.",
-                    description="Searches the web for relevant information on a wide range of topics."
-                )
-            )
-    
-    # Define a backup tool that doesn't require web access
-    backup_tool = Tool(
-        name="Knowledge Base",
-        func=lambda x: general_llm.invoke(f"Please provide information about: {x}").content,
-        description="Uses internal knowledge to answer questions when web search is unavailable."
-    )
-    
-    search_tools.append(backup_tool)
+            search_tools.append(Tool(
+                name="Web Search",
+                func=lambda x: "Web search unavailable.",
+                description="Searches the web."
+            ))
 
-    # Use initialize_agent instead of create_react_agent with increased limits
-    return initialize_agent(
+    search_tools.append(Tool(
+        name="Knowledge Base",
+        func=lambda x: general_llm.invoke(
+            f"Answer this question using your training knowledge: {x}"
+        ).content,
+        description="Uses internal knowledge when web search is unavailable."
+    ))
+
+    agent = initialize_agent(
         tools=search_tools,
         llm=general_llm,
         agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
         verbose=True,
         handle_parsing_errors=True,
-        max_iterations=20,
-        max_execution_time=60
+        max_iterations=8,
+        max_execution_time=45,
     )
+    return ("react", agent)
 
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 def format_conversation_history(history):
-    """Format conversation history for prompt inclusion"""
     if not history:
         return "No previous conversation."
-    
-    formatted = []
-    for i, exchange in enumerate(history):
-        formatted.append(f"Exchange {i+1}:")
-        formatted.append(f"User: {exchange['query']}")
-        formatted.append(f"Agent ({exchange['category']}): {exchange['response']}")
-    
-    return "\n".join(formatted)
+    lines = []
+    for i, ex in enumerate(history):
+        lines += [
+            f"Exchange {i+1}:",
+            f"  User: {ex['query']}",
+            f"  Agent ({ex['category']}): {ex['response'][:300]}...",
+        ]
+    return "\n".join(lines)
 
-def build_workflow(orchestrator_chain, math_science_executor, code_executor, websearch_executor):
-    """Build the LangGraph workflow with context awareness"""
-    
+
+def _invoke_web_fallback(websearch_agent, query: str) -> str:
+    """Run the web search agent and return its response string."""
+    mode, executor = websearch_agent
+    try:
+        return executor.run(query)
+    except Exception as e:
+        return f"Web search also failed: {str(e)}"
+
+
+# ── Workflow Builder ──────────────────────────────────────────────────────────
+def build_workflow(orchestrator_chain, math_science_agent, code_agent, websearch_agent):
+
     def classify_query(state: AgentState) -> Dict:
-        """Classify the query and determine which agent to route to."""
         formatted_history = format_conversation_history(state["conversation_history"])
-        category = orchestrator_chain.run(
-            query=state["query"], 
-            conversation_history=formatted_history
-        ).strip().lower()
-        
+        result = orchestrator_chain.invoke({
+            "query": state["query"],
+            "conversation_history": formatted_history
+        })
+        # result is an AIMessage when using pipe syntax
+        category = result.content.strip().lower()
+        # Sanitise
         if category not in ["math/science", "code", "websearch"]:
-            category = "websearch"  # Default to websearch for unrecognized categories
-        return {"category": category}
+            category = "websearch"
+        return {"category": category, "agents_tried": []}
 
     def route_to_agent(state: AgentState) -> Literal["math_science", "code", "websearch"]:
-        """Route to the appropriate agent based on category."""
-        category = state["category"]
-        if category == "math/science":
+        c = state["category"]
+        if c == "math/science":
             return "math_science"
-        elif category == "code":
+        elif c == "code":
             return "code"
-        else:
-            return "websearch"
+        return "websearch"
 
+    # ── Math / Science node ──────────────────────────────────────────────────
     def process_math_science(state: AgentState) -> Dict:
-        """Process query with math/science agent with context awareness."""
-        # Include context in the query sent to the agent
         formatted_history = format_conversation_history(state["conversation_history"])
-        context_query = f"""
-Previous conversation: 
-{formatted_history}
+        mode, executor = math_science_agent
+        agents_tried = list(state.get("agents_tried", []))
 
-Current question: {state["query"]}
+        system_prompt = (
+            "You are an expert mathematician and scientist. "
+            "Solve problems step-by-step with clear working. "
+            "For derivations, show every algebraic step. "
+            "Be precise and rigorous."
+        )
+        context_query = (
+            f"Previous conversation:\n{formatted_history}\n\n"
+            f"Current question: {state['query']}\n\n"
+            "Provide a complete, accurate answer."
+        )
 
-Please answer the current question considering any relevant context from the previous conversation.
-Take your time with mathematical and scientific problems, especially for complex topics like linear programming.
-"""
+        # ── Try specialized math agent first ────────────────────────────────
+        primary_label = "🧪 Math/Science Agent (Wolfram+LLM)" if mode == "react" else "🧪 Math/Science Agent (LLM)"
+        agents_tried.append(primary_label)
         try:
-            response = math_science_executor.run(context_query)
-            return {"response": f"🧪 Math/Science Agent: {response}"}
-        except Exception as e:
-            # Handle timeout or other exceptions gracefully
-            error_message = str(e)
-            return {"response": f"🧪 Math/Science Agent: I encountered a complexity limit with this problem. Here's what I know about this topic: {error_message[:200]}... Please consider reformulating or breaking down your question."}
+            if mode == "react":
+                response = executor.run(context_query)
+            else:
+                messages = [("system", system_prompt), ("human", context_query)]
+                response = executor.invoke(messages).content
 
+            return {
+                "response": f"{primary_label}:\n\n{response}",
+                "agents_tried": agents_tried
+            }
+
+        except Exception as primary_err:
+            # ── Fallback: web search ─────────────────────────────────────────
+            agents_tried.append("🔍 Web Search Agent (fallback)")
+            web_response = _invoke_web_fallback(
+                websearch_agent,
+                f"Solve this math/science problem: {state['query']}"
+            )
+            return {
+                "response": (
+                    f"{primary_label}: Could not solve directly "
+                    f"(`{str(primary_err)[:120]}`)\n\n"
+                    f"🔍 Web Search Agent (fallback):\n\n{web_response}"
+                ),
+                "agents_tried": agents_tried
+            }
+
+    # ── Code node ────────────────────────────────────────────────────────────
     def process_code(state: AgentState) -> Dict:
-        """Process query with code agent with context awareness."""
         formatted_history = format_conversation_history(state["conversation_history"])
-        context_query = f"""
-Previous conversation: 
-{formatted_history}
+        mode, executor = code_agent
+        agents_tried = list(state.get("agents_tried", []))
 
-Current question: {state["query"]}
+        system_prompt = (
+            "You are an expert software engineer. "
+            "Write clean, well-commented, production-quality code. "
+            "Explain your approach, provide the full implementation, "
+            "and include a brief complexity analysis."
+        )
+        context_query = (
+            f"Previous conversation:\n{formatted_history}\n\n"
+            f"Current question: {state['query']}\n\n"
+            "Provide a complete, working solution."
+        )
 
-Please answer the current question considering any relevant context from the previous conversation.
-"""
+        # ── Try specialized code agent first ────────────────────────────────
+        agents_tried.append("💻 Code Agent (LLM)")
         try:
-            response = code_executor.run(context_query)
-            return {"response": f"💻 Code Agent: {response}"}
-        except Exception as e:
-            error_message = str(e)
-            return {"response": f"💻 Code Agent: I hit a complexity limit while working on this problem. Please consider simplifying your query or breaking it into smaller parts."}
+            messages = [("system", system_prompt), ("human", context_query)]
+            response = executor.invoke(messages).content
+            return {
+                "response": f"💻 Code Agent (LLM):\n\n{response}",
+                "agents_tried": agents_tried
+            }
 
+        except Exception as primary_err:
+            # ── Fallback: web search ─────────────────────────────────────────
+            agents_tried.append("🔍 Web Search Agent (fallback)")
+            web_response = _invoke_web_fallback(
+                websearch_agent,
+                f"Provide a code solution for: {state['query']}"
+            )
+            return {
+                "response": (
+                    f"💻 Code Agent: Could not solve directly "
+                    f"(`{str(primary_err)[:120]}`)\n\n"
+                    f"🔍 Web Search Agent (fallback):\n\n{web_response}"
+                ),
+                "agents_tried": agents_tried
+            }
+
+    # ── Web Search node (primary) ─────────────────────────────────────────────
     def process_websearch(state: AgentState) -> Dict:
-        """Process query with websearch agent with context awareness."""
         formatted_history = format_conversation_history(state["conversation_history"])
-        context_query = f"""
-Previous conversation: 
-{formatted_history}
+        mode, executor = websearch_agent
+        agents_tried = list(state.get("agents_tried", []))
+        agents_tried.append("🔍 Web Search Agent")
 
-Current question: {state["query"]}
-
-Please answer the current question considering any relevant context from the previous conversation.
-If web search is unavailable, please answer using your internal knowledge.
-"""
+        context_query = (
+            f"Previous conversation:\n{formatted_history}\n\n"
+            f"Current question: {state['query']}\n\n"
+            "Search for current information and give a comprehensive answer."
+        )
         try:
-            response = websearch_executor.run(context_query)
-            return {"response": f"🔍 Web Search Agent: {response}"}
+            response = executor.run(context_query)
+            return {
+                "response": f"🔍 Web Search Agent:\n\n{response}",
+                "agents_tried": agents_tried
+            }
         except Exception as e:
-            # Fall back to the LLM's built-in knowledge
-            fallback_response = general_llm.invoke(f"""
-You are a helpful assistant answering a question based on your training knowledge without web search.
-The question is: {state["query"]}
-Please provide a helpful response using only what you already know.
-""").content
-            return {"response": f"🔍 Web Search Agent: I'm unable to search the web right now, but here's what I know: {fallback_response}"}
+            _, llm = code_agent  # borrow any LLM for offline fallback
+            fallback = llm.invoke(
+                f"Answer from your training knowledge: {state['query']}"
+            ).content
+            return {
+                "response": f"🔍 Web Search Agent (offline):\n\n{fallback}",
+                "agents_tried": agents_tried
+            }
 
-    # Build the LangGraph
+    # ── Build Graph ───────────────────────────────────────────────────────────
     workflow = StateGraph(AgentState)
-
-    # Add nodes
-    workflow.add_node("classifier", classify_query)
+    workflow.add_node("classifier",   classify_query)
     workflow.add_node("math_science", process_math_science)
-    workflow.add_node("code", process_code)
-    workflow.add_node("websearch", process_websearch)
+    workflow.add_node("code",         process_code)
+    workflow.add_node("websearch",    process_websearch)
 
-    # Add edges
     workflow.add_conditional_edges(
         "classifier",
         route_to_agent,
-        {
-            "math_science": "math_science",
-            "code": "code",
-            "websearch": "websearch"
-        }
+        {"math_science": "math_science", "code": "code", "websearch": "websearch"}
     )
-
-    # Connect all agents to END
     workflow.add_edge("math_science", END)
-    workflow.add_edge("code", END)
-    workflow.add_edge("websearch", END)
-
-    # Set entry point
+    workflow.add_edge("code",         END)
+    workflow.add_edge("websearch",    END)
     workflow.set_entry_point("classifier")
 
-    # Compile the graph
     return workflow.compile()
